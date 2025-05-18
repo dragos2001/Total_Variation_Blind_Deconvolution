@@ -2,7 +2,7 @@ import numpy as np
 from scipy.signal import convolve2d
 from scipy.sparse.linalg import cg
 from scipy.ndimage import convolve
-from blind_deconvolution import rotated_anisotropic_gaussian_kernel , blur_kernel
+from blur_kernels import show_kernels,show_blurred_image
 from math import pi,e
 from numpy.fft import fft2, ifft2, fftshift
 import cv2
@@ -10,6 +10,65 @@ import matplotlib.pyplot as plt
 from L1_support import add_gaussian_noise , calculate_ssim , peak_signal_noise_ratio
 from blind_deconvolution import fft_deconvolution
 from scipy.sparse.linalg import LinearOperator
+from scipy.fftpack import dct
+from scipy.fft import dctn, idctn
+from scipy.sparse import coo_matrix
+from skimage.measure import block_reduce
+
+
+# =============================================================================
+# def conv2d_operator_sparse(kernel, input_shape, mode='same',mode_adjoint=False):
+#     kH, kW = kernel.shape
+#     iH, iW = input_shape
+#     
+#     if mode == 'full':
+#         pad_h, pad_w = kH - 1, kW - 1
+#         oH, oW = iH + kH - 1, iW + kW - 1
+#     elif mode == 'same':
+#         pad_h = kH // 2
+#         pad_w = kW // 2
+#         oH, oW = iH, iW
+#     elif mode == 'valid':
+#         pad_h = pad_w = 0
+#         oH, oW = iH - kH + 1, iW - kW + 1
+#     else:
+#         raise ValueError("Mode must be 'valid', 'same', or 'full'.")
+# 
+# # =============================================================================
+# #     # Pad input size
+# #     padded_iH = iH + 2 * pad_h
+# #     padded_iW = iW + 2 * pad_w
+# # =============================================================================
+# 
+#     # Flip kernel
+#     if mode_adjoint == False :
+#         kernel = np.flipud(np.fliplr(kernel))
+# 
+#     data = []
+#     rows = []
+#     cols = []
+# 
+#     for ki in range(kH):
+#         for kj in range(kW):
+#             val = kernel[ki, kj]
+#             for i in range(oH):
+#                 for j in range(oW):
+#                     row = i * oW + j
+#                     ii = i + ki
+#                     jj = j + kj
+# 
+#                     if 0 <= ii - pad_h < iH and 0 <= jj - pad_w < iW:
+#                         col = (ii - pad_h) * iW + (jj - pad_w)
+#                         rows.append(row)
+#                         cols.append(col)
+#                         data.append(val)
+# 
+#     A = coo_matrix((data, (rows, cols)), shape=(oH * oW, iH * iW))
+#     return A.tocsr()
+# 
+# =============================================================================
+
+
 
 def gradient(u):
     ux = np.roll(u, -1, axis=1) - u
@@ -25,63 +84,244 @@ def tv_weights(u, epsilon=1e-3):
     ux, uy = gradient(u)
     return 1.0 / np.sqrt(ux**2 + uy**2 + epsilon)
 
-def solve_u(f, h, u0, lambda1, max_fp_iter=10, rtol=1e-5,atol=0.1):
+def solve_u(f, h, u0, lambda1, max_fp_iter=3,epsilon=1e-8, rtol=1e-3,atol=0.1):
     u = u0.copy()
     h_flipped = np.flip(np.flip(h, axis=0), axis=1)
-
-    for _ in range(max_fp_iter):
+    image_shape = f.shape
+    for i in range(max_fp_iter):
+        print(f"Solve u: {i+1} iteration")
         w = tv_weights(u)
-
+            
         def A(u_flat):
-            u_img = u_flat.reshape(f.shape)
+            u_img = u_flat.reshape(image_shape)
             Hu = convolve2d(u_img, h, mode='same', boundary='symm')
             HTHu = convolve2d(Hu, h_flipped, mode='same', boundary='symm')
-            gradient_ux , gradient_uy = gradient(u)
+            gradient_ux , gradient_uy = gradient(u_img)
             div_grad = divergence(w * gradient_ux , w * gradient_uy)
             
             return (HTHu - lambda1 * div_grad).flatten()
         
-        A_operator = LinearOperator ( shape = (f.size, f.size) , matvec = A)
-        b_img = convolve2d (f, h_flipped, mode='same', boundary='symm')
-        b = b_img.flatten()
+        def cosine_preconditioner(h, shape, w,epsilon=1e-8,average=True):
+                # 1. Delta impulse image
+                delta = np.zeros(shape)
+                delta[shape[0]//2,shape[1]//2] = 1
+            
+                # 2. Simulate HᵗH delta
+                h_flip = np.flipud(np.fliplr(h))
+                Hd = convolve2d(delta, h, mode='same', boundary='symm')
+                HTHd = convolve2d(Hd, h_flip, mode='same', boundary='symm')
+            
+                # 3. Total variation diagonal approx (optional)
+                gradient_deltax , gradient_deltay = gradient(delta)
+                
+                if average == False:
+                    div_grad_delta = divergence(w * gradient_deltax , w * gradient_deltay)
+                else:
+                    w_avg = np.mean(w)
+                    div_grad_delta = divergence(w_avg * gradient_deltax , w_avg * gradient_deltay)
+               
+                # 4. DCT spectrum of HᵗH
+                spectrum = dctn(HTHd, norm='ortho') + dctn(div_grad_delta,norm ='ortho') + epsilon
+                
+                # 6. Inverse (diagonal of preconditioner)
+                inv_spectrum = 1.0 / spectrum
+                return inv_spectrum
+            
+        def apply_preconditioner(v, inv_spectrum, shape):
+            v_img = v.reshape(shape)
+            V = dctn(v_img, norm='ortho')
+            Y = inv_spectrum * V  # element-wise multiplication
+            y_img = idctn(Y, norm='ortho')
+            return y_img.flatten()
+            
+        #Inv spectrum
+        inv_spectrum = cosine_preconditioner(h, shape = image_shape  , w=w, epsilon=epsilon, average=True)
+        
+        
+        A_shape=(image_shape[0]**2,image_shape[0]**2)
+        #A preconditioner operator
+        A_operator = LinearOperator(shape = A_shape, matvec=A,dtype = np.float16)
+        
+        #M preconditioner operator
+        M_operator = LinearOperator(shape =  A_shape, matvec=lambda v: apply_preconditioner( v , inv_spectrum, shape = image_shape),dtype = np.float16)
+        
+        #Convolution
+        b_img = convolve2d(f, h_flipped, mode='same', boundary='symm')
+        b_flat = b_img.flatten()
+        x0_flat = u.flatten()
+        print("x0_flat shape:",x0_flat.shape)
+        u_flat, info = cg(A_operator, b=b_flat, x0=x0_flat, M=M_operator, rtol=rtol, atol=atol)
 
-        u_flat, _ = cg(A_operator, b, x0 = u.flatten() , rtol = rtol)
-        u = u_flat.reshape(f.shape)
         
-        #Normalize
-        u[u<0]=0
-        
+        u = u_flat.reshape(image_shape)
+        u[u < 0] = 0
+    
     return u
 
-def solve_h(f, u, h0, lambda2, max_fp_iter=10, rtol=1e-5,atol=0.1):
+# =============================================================================
+# def Lu_operator(v_img, w):
+#     # v_img shape = (iH, iW)
+#     ux = np.roll(v_img, -1, axis=1) - v_img
+#     uy = np.roll(v_img, -1, axis=0) - v_img
+#     
+#     wx_inv = 1.0 / (w + 1e-8)  # To avoid division by zero
+#     
+#     px = wx_inv * ux
+#     py = wx_inv * uy
+#     thi
+#     div_p = (px - np.roll(px, 1, axis=1)) + (py - np.roll(py, 1, axis=0))
+#     return -div_p
+# =============================================================================
+
+# =============================================================================
+# 
+# def solve_u_toeplitz(f, h, u0, lambda1, max_fp_iter=3, rtol=1e-3,atol=0.1):
+#     u = u0.copy()
+#     shape_image=u.shape
+# 
+#     for _ in range(max_fp_iter):
+#         w = tv_weights(u)
+# 
+#    
+#         H = conv2d_operator_sparse(h,shape_image , mode='same' , mode_adjoint=False)
+#         H = conv2d_operator_sparse(h,shape_image , mode='same' , mode_adjoint=True)
+#         Lu =    Lu_operator(u,w) 
+#         
+#         
+#         
+#         #u_img = u_flat.reshape(f.shape)
+#         def DCT_preconditioned_A(u_flat):
+#             # Apply DCT on the matrix-vector product
+#             spatial_product = A(u_flat)
+#             # Transform to frequency domain
+#             return dctn(spatial_product)
+#         
+#         #Creating the LinearOperator with DCT preconditioning for A
+#         A_operator = LinearOperator ( shape = (f.size, f.size) , matvec = DCT_preconditioned_A )
+#         #Img
+#         b_img = convolve2d (f, h_flipped, mode='same', boundary='symm')
+#         
+#         #Dctn
+#         b_dct = dctn(b_img)
+#         b_dct_flat = b_dct.flatten()
+#         x0_dct = dctn(u)
+#         x0_dct_flat = x0_dct.flatten()
+#         
+#         #Conjugate Gradient
+#         u_flat , _ = cg(A_operator , b = b_dct_flat , x0 = x0_dct_flat , rtol = rtol , atol=atol)
+#         
+#         #Reshape the solution back to image space
+#         u = idctn(u_flat.reshape(f.shape))
+#         
+#         #Normalize
+#         u[u<0]=0
+#         
+#     return u
+# =============================================================================
+def crop(image, crop_size):
+    
+    croped_image= image[ image.shape[0]//2-crop_size//2 : image.shape[0]//2 + crop_size//2 + 1  ,  image.shape[1] // 2 - crop_size//2 : image.shape[1]//2 + crop_size//2 + 1]
+
+    return croped_image
+
+def solve_h(f, u, h0, lambda2, max_fp_iter=3,epsilon=1e-8, rtol=1e-3,atol=0.1):
     h = h0.copy()
     u_flipped = np.flip(np.flip(u, axis=0), axis=1)
-
-    for _ in range(max_fp_iter):
+    image_shape = f.shape
+    
+    if h.shape != image_shape:
+        h_padded = np.zeros(image_shape)
+        dir1 = h.shape[0]//2
+        dir2 = h.shape[0]//2+1
+        h_padded [f.shape[0]//2 - dir1 : f.shape[0]//2 + dir2 , f.shape[1]//2 - dir1 : f.shape[1]//2 + dir2] = h
+        h_shape = h_padded.shape
+        h=h_padded
+    else :
+        h_shape = h.shape
+       
+    
+    for i in range(max_fp_iter):
+        print(f"Solve h: {i+1} iteration")
         w = tv_weights(h)
 
         def A(h_flat):
-            h_img = h_flat.reshape(h.shape)
+            h_img = h_flat.reshape(h_shape)
             UH = convolve2d(h_img, u, mode='same', boundary='symm')
             UTUH = convolve2d(UH, u_flipped, mode='same', boundary='symm')
-            gradient_hx , gradient_hy = gradient(h)
+            gradient_hx , gradient_hy = gradient(h_img)
             div_grad = divergence(w*gradient_hx, w*gradient_hy)
             return (UTUH - lambda2 * div_grad).flatten()
         
-        A_operator = LinearOperator ( shape = (h0.size, h0.size) , matvec = A)
+         
+        def cosine_preconditioner(u, shape, w,epsilon=1e-8,average=True):
+                # 1. Delta impulse image
+                delta = np.zeros(shape)
+                delta[shape[0]//2,shape[1]//2] = 1
+            
+                # 2. Simulate HᵗH delta
+                u_flip = np.flipud(np.fliplr(u))
+                Ud = convolve2d(delta, u, mode='same', boundary='symm')
+                UTUd = convolve2d(Ud, u_flip, mode='same', boundary='symm')
+            
+                # 3. Total variation diagonal approx (optional)
+                gradient_deltax , gradient_deltay = gradient(delta)
+                
+                if average == False:
+                    div_grad_delta = divergence(w * gradient_deltax , w * gradient_deltay)
+                else:
+                    w_avg = np.mean(w)
+                    div_grad_delta = divergence(w_avg * gradient_deltax , w_avg * gradient_deltay)
+               
+                # 4. DCT spectrum of HᵗH
+                spectrum = dctn(UTUd, norm='ortho') + dctn(div_grad_delta,norm ='ortho') + epsilon
+                
+                # 6. Inverse (diagonal of preconditioner)
+                inv_spectrum = 1.0 / spectrum
+                return inv_spectrum
+            
+        def apply_preconditioner(v, inv_spectrum, shape):
+            v_img = v.reshape(shape)
+            V = dctn(v_img, norm='ortho')
+            Y = inv_spectrum * V  # element-wise multiplication
+            y_img = idctn(Y, norm='ortho')
+            return y_img.flatten()
+        
+        
+        #Inv spectrum
+        inv_spectrum = cosine_preconditioner(u, shape= h_shape , w = w, epsilon=epsilon, average=True)
+        A_shape=(image_shape[0]**2,image_shape[0]**2)
+        #Creating the LinearOperator with DCT preconditioning for A
+        A_operator = LinearOperator ( shape = A_shape , matvec = A , dtype = np.float16)
+        
+        #M preconditioner operator 
+        M_operator = LinearOperator( shape = A_shape, matvec = lambda v: apply_preconditioner(v,inv_spectrum, shape = h_shape),dtype = np.float16 )
+       
+        #Img
         b_img = convolve2d(f, u_flipped, mode='same', boundary='symm')
-        b = b_img.flatten()
+        
+        #B image
+        b_flat = b_img.flatten()
+        
+        #Initial solution
+        x0 = h
+        
+        #Flatten version
+        x0_flat = x0.flatten()
 
-        h_flat, _ = cg(A_operator, b, x0=h.flatten(), rtol=rtol)
+        #Conjugate Gradient 
+        h_flat , _ = cg(A_operator , b = b_flat , x0 = x0_flat , M = M_operator ,rtol = rtol , atol=atol)        
+        #Reshape the solution back to iamge space
         h = h_flat.reshape(h.shape)
 
         # Normalize and project
         h[h < 0] = 0
-        h= (h + h.transpose)//2
+        h= (h + h.transpose)/2
         h /= (np.sum(h) + 1e-8)
 
+    h = crop(h,h0.shape[0])
+    
     return h
-
+    
 def blind_deconvolution_am(f, kernel_shape, lambda1, lambda2, num_am_iter=10):
     u = f.copy()
     h = np.zeros(kernel_shape)
@@ -95,95 +335,68 @@ def blind_deconvolution_am(f, kernel_shape, lambda1, lambda2, num_am_iter=10):
     return u, h
 
 if __name__  ==  "__main__" :
+    
+    
+    
+    
+    
+    #all params
+    kernel_size = (15,15)
+    sigma_g = 2
+    sigma_x = 2
+    sigma_y = 8
+    theta = pi/4
+    
     #kernel
-    kernel_size=(5,5)
-    kernel_matrix_gaussian_blur = blur_kernel(sigma = 0.5, shape = kernel_size)
-    kernel_matrix_motion_blur = rotated_anisotropic_gaussian_kernel(kernel_size[0] , sigma_x = 2 , sigma_y=10, theta=pi/4)
-    
-    fig1,axs1 = plt.subplots(1,2)
-    fig1.suptitle("Blur Kernels")
-    
-    #Axes 0
-    axs1[ 0].set_title("Original Image")
-    axs1[ 0].imshow(kernel_matrix_gaussian_blur , cmap='gray')
-    axs1[ 0].axis("off")
-    
-    #---------------------------------
-    #Axes 1
-    axs1[ 1].set_title("Blurred Image")
-    axs1[ 1].imshow(kernel_matrix_motion_blur , cmap='gray')
-    axs1[ 1].axis("off")
-    
-    
-    plt.show()
-    
-    
-    
-    
+    kernel_matrix_gaussian_blur , kernel_matrix_motion_blur = show_kernels( kernel_size , sigma_g , sigma_x , sigma_y, theta)
     
     #Read an image
     frame = cv2.imread('lena.png',cv2.IMREAD_GRAYSCALE)
-    blurred_image = convolve2d(frame, kernel_matrix_gaussian_blur,mode="same")
-    blurred_image = np.array( blurred_image , dtype = int )
-    size=frame.shape[:2]
+    frame = block_reduce(frame , block_size=4,func= np.mean)
+    plt.imshow(frame,cmap='gray')
+    plt.title("Original Image")
+    plt.axis('off')
+    plt.show()
     
-    #img
-    img_motion_blur = convolve2d(frame , kernel_matrix_motion_blur,mode="same",boundary='wrap')
+    #input shape
+    input_shape=frame.shape
     
-    #---------------------------------
-    #Figure
-    fig, axs=plt.subplots(2,2)
+    #convolution matrix H
+    #H = conv2d_operator_sparse(kernel_matrix_gaussian_blur, input_shape)
     
-    #---------------------------------
-    #Axes 0
-    axs[0 , 0].set_title("Original Image")
-    axs[0 , 0].imshow(frame , cmap='gray')
-    axs[0 , 0].axis("off")
+    #Gaussian and Motion Blurred Image
+    gaussian_blurred_image = show_blurred_image( frame , kernel_matrix_gaussian_blur  , title = "Gaussian Blurred" )
+    motion_blurred_image = show_blurred_image( frame , kernel_matrix_motion_blur  , title = "Motion Blurred" )
     
-    #---------------------------------
-    #Axes 1
-    axs[0 , 1].set_title("Blurred Image")
-    axs[0 , 1].imshow(blurred_image , cmap='gray')
-    axs[0 , 1].axis("off")
-    
-    #---------------------------------
     #Add noise 
-    noisy_blurred_image = add_gaussian_noise(blurred_image , 0 , 30)
-    
-    #---------------------------------
-    #Axes2
-    axs[1,0].set_title("Noisy Image")
-    axs[1,0].imshow(noisy_blurred_image , cmap='gray')
-    axs[1,0].axis("off")
+    noisy_blurred_image = add_gaussian_noise( gaussian_blurred_image , 0 , 30 )
+    plt.imshow(noisy_blurred_image , cmap='gray')
+    plt.title("Noisy Blurred Image")
+    plt.axis("off")
+    plt.show()
 
-    #total variation deconv-----------
+    #Total Variation deconvolution
+    print("Blind TV started: ")
     alfa1 = 2*10 **(-6)
     alfa2 = 1.5*10 **(-5)
     u_image, h_kernel = blind_deconvolution_am( noisy_blurred_image , kernel_size , alfa1 , alfa2)
    
     #Axes2
-    axs[1,1].set_title("Reconstructed Image")
-    axs[1,1].imshow(u_image , cmap='gray')
-    axs[1,1].axis("off")
-
+    plt.imshow(u_image , cmap='gray')
+    plt.title("Reconstructed Image")
+    plt.axis("off")
+    plt.show()
+    
     #ssim
-    ssim_original = calculate_ssim(frame , frame)
-    ssim_blurred = calculate_ssim(frame , blurred_image)
+    ssim_blurred = calculate_ssim(frame , gaussian_blurred_image)
     ssim_noisy_blurred = calculate_ssim(frame, noisy_blurred_image)
     ssim_rec = calculate_ssim(frame, u_image)
     
-    #psnr noisy blurred
+    #psnr
     psnr_noisy_blurred = peak_signal_noise_ratio( frame , noisy_blurred_image)
     psnr_reconstructed = peak_signal_noise_ratio( frame , u_image)
     plt.show()
     
     
-    #plot imshow motion blur
-    plt.imshow(img_motion_blur , cmap='gray')
-    plt.show()
-    
-    
-    #deconvolve the image 
-    original_image = fft_deconvolution(img_motion_blur , kernel_matrix_motion_blur) 
-    plt.imshow(original_image , cmap='gray')
-    plt.show()
+
+ 

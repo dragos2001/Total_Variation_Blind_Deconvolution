@@ -13,6 +13,73 @@ from scipy.signal import  convolve2d
 from scipy.signal import fftconvolve
 from math import pi,e
 from numpy.fft import fft2, ifft2, fftshift
+from blur_kernels import show_kernels
+from scipy.sparse import lil_matrix
+
+def build_main_K_2 ( kernel , image_size ):
+    
+    kernel_size = kernel.shape[0]
+    t = image_size - kernel_size + 1
+    rows_K = t 
+    cols_K = kernel_size * (kernel_size +t-1)
+    matrix_K = lil_matrix((rows_K, cols_K)) 
+    
+    for r in range (matrix_K.shape[0]):
+        for i in range(kernel.shape[0]):
+            start_index =  ( kernel_size + t - 1) * i + r 
+            end_index = (start_index + kernel_size )
+            matrix_K[r , start_index : end_index] = kernel[i,:]
+            
+    return matrix_K
+
+
+def build_toeplitz(matrix_K,kernel_size,image_size):
+     
+    t = image_size - kernel_size + 1 
+    
+    toeplitz_k=[]
+    for h in range (t):
+        
+        s_matrix = np.zeros((t,image_size*(t-1-h)))
+        if h>0:
+            f_matrix = np.zeros((t,h))
+            row = np.concatenate((f_matrix , matrix_K , s_matrix),axis=1)
+        else:
+            row = np.concatenate((matrix_K , s_matrix),axis=1)
+        toeplitz_k.append(row)
+        
+    
+    toeplitz_concat=np.concatenate(toeplitz_k,axis=0)
+    return toeplitz_concat
+
+
+
+def build_sparse_toeplitz(matrix_K, kernel_size, image_size):
+    t = image_size - kernel_size + 1 
+    rows_K = matrix_K.shape[0] * t 
+    cols_K = image_size * (t - 1) + matrix_K.shape[1]
+    
+    toeplitz = lil_matrix((rows_K, cols_K))  # sparse instead of dense
+    print(toeplitz.size)
+    
+    for row in range(t):
+       
+        #Start_x
+        start_x = row*t
+        
+        #End_x
+        end_x = start_x + matrix_K.shape[0]
+        
+        #Start_y
+        start_y = row * image_size
+        
+        #End_y
+        end_y = start_y + matrix_K.shape[1]
+        
+        #Toeplitz
+        toeplitz[start_x : end_x  , start_y : end_y ]=matrix_K
+    
+    return toeplitz
 
 
 def fft_deconvolution(blurred, kernel, epsilon=1e-6):
@@ -271,10 +338,14 @@ def compute_gradient_in_2D(image , mask):
 
 if __name__  ==  "__main__" :
     
+    #all params
+    kernel_size = (15,15)
+    sigma_g = 2
+    sigma_x = 2
+    sigma_y = 8
+    theta = pi/4
     #kernel
-    kernel_size=(15,15)
-    kernel_matrix_gaussian_blur = blur_kernel(sigma = 0.5, shape = kernel_size)
-    kernel_matrix_motion_blur = rotated_anisotropic_gaussian_kernel(kernel_size[0] , sigma_x = 2 , sigma_y=10, theta=pi/4)
+    kernel_matrix_gaussian_blur , kernel_matrix_motion_blur = show_kernels( kernel_size , sigma_g , sigma_x , sigma_y, theta)
     
     
     
