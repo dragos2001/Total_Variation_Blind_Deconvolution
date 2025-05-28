@@ -170,6 +170,9 @@ def divergence_image_smoothing_term(image , epsilon , theta):
     
     return divergence
 
+
+
+
 #inner loop for h
 def iterative_inner_loop_h_kernel(n_iterations, u, h , z, alfa2, deviation = 0.05, step=0.05):
     

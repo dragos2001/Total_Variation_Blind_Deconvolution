@@ -65,15 +65,27 @@ def conv2d_operator_sparse(kernel, input_shape, mode='same',mode_adjoint=False):
     A = coo_matrix((data, (rows, cols)), shape=(oH * oW, iH * iW))
     return A.tocsr()
 
-def convolve_fft(h, u):
+#first and then u
+def convolve_fft(h, u,mode="kernel"):
     
     # Zero-pad h (Dirichlet), reflect-pad u (Neumann)
     full_shape = (u.shape[0] + h.shape[0] - 1, u.shape[1] + h.shape[1] - 1)
     # Pad h with zeros (Dirichlet BCs)
-    h_pad = pad_image_neuman( h,( (( full_shape[0] - h.shape[0] ) //2 , ( full_shape[1]-h.shape[1] )//2 ) ) )
+    h_pad = pad_image_dirichlet( h,( (( full_shape[0] - h.shape[0] ) //2 , ( full_shape[1]-h.shape[1] )//2 ) ) )
     u_pad = pad_image_neuman( u,( (( full_shape[0] - u.shape[0] ) //2 , ( full_shape[1]-u.shape[1] )//2 ) ) )
     
-    return np.real(ifft2(fft2(h_pad) * fft2(u_pad))[:u.shape[0], :u.shape[1]])
+    if mode == "kernel":
+        start_x = (full_shape[0] - h.shape[0]) // 2
+        start_y = (full_shape[1] - h.shape[1]) // 2
+        increment_x = h.shape[0]
+        increment_y = h.shape[1]
+    else : 
+        start_x = (full_shape[0] - u.shape[0]) // 2
+        start_y = (full_shape[1] - u.shape[1]) // 2
+        increment_x = u.shape[0]
+        increment_y = u.shape[1]
+        
+    return np.real(ifft2(fft2(h_pad) * fft2(u_pad))[start_x : start_x + increment_x, start_y : start_y + increment_y])
 
 
 def compute_gradients_dirichlet(u):
